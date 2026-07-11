@@ -1,12 +1,12 @@
 {
-  "name": "Ricoh Offerte Studio Pro v5",
-  "short_name": "Ricoh Offerte",
-  "description": "Professionele AV-offerte tool voor Ricoh Belgium",
+  "name": "QuoteStudio — Offerte Studio",
+  "short_name": "QuoteStudio",
+  "description": "Professionele white-label offertetool — QuoteStudio",
   "start_url": "/quoteassist/",
   "scope": "/quoteassist/",
   "display": "standalone",
-  "background_color": "#BE1622",
-  "theme_color": "#BE1622",
+  "background_color": "#2563eb",
+  "theme_color": "#2563eb",
   "orientation": "any",
   "lang": "nl",
   "icons": [
