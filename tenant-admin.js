@@ -47,6 +47,12 @@
       hint: "Vervangt overal de tekst in de app en is het woordmerk zonder eigen logo." },
     { key: "companyName",      label: "Bedrijfsnaam",     type: "text" },
     { key: "primaryColor",     label: "Merkkleur",        type: "color" },
+    { key: "coverColor",       label: "Cover-kleur",      type: "color",
+      hint: "Achtergrond van de coverpagina. Leeg/gelijk = volgt de merkkleur." },
+    { key: "logoBackdrop",     label: "Logo op wit vlak (cover)", type: "checkbox",
+      hint: "Toont een subtiel wit kader achter het cover-logo, leesbaar op elke kleur." },
+    { key: "showMraas",        label: "MRaaS-knop tonen", type: "checkbox",
+      hint: "Ricoh-specifiek. Standaard uit; enkel aanzetten voor een Ricoh-tenant." },
     { key: "website",          label: "Website",          type: "text" },
     { key: "address",          label: "Adres",            type: "textarea" },
     { key: "vatLabel",         label: "BTW-label",        type: "text" },
@@ -67,12 +73,12 @@
   /* camelCase → snake_case voor de Supabase 'qs_tenants'-tabel */
   var DB = {
     slug: "slug", companyName: "company_name", companyNameShort: "company_name_short",
-    primaryColor: "primary_color", website: "website", address: "address",
+    primaryColor: "primary_color", coverColor: "cover_color", website: "website", address: "address",
     rszLabel: "rsz_label", rszNumber: "rsz_number", vatLabel: "vat_label",
     vatNumber: "vat_number", signingLegalUrl: "signing_legal_url",
     contactSubtitle: "contact_subtitle", pwaName: "pwa_name",
     pwaShortName: "pwa_short_name", logo: "logo_svg", logoWhite: "logo_svg_white",
-    pdfFooter: "pdf_footer"
+    pdfFooter: "pdf_footer", logoBackdrop: "logo_backdrop", showMraas: "show_mraas"
   };
 
   var _originalTenant = null;
@@ -116,6 +122,10 @@
           '" style="width:46px;height:38px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer">' +
           '<input type="text" id="' + id + '-t" value="' + esc(hex) +
           '" style="' + inputCss() + 'flex:1"></div>';
+      } else if (f.type === "checkbox") {
+        var on = TC.all()[f.key] ? " checked" : "";
+        input = '<input type="checkbox" id="' + id + '"' + on +
+          ' style="width:18px;height:18px;vertical-align:middle;cursor:pointer;margin-top:2px">';
       } else {
         input = '<input type="text" id="' + id + '" value="' + val + '" style="' + inputCss() + '">';
       }
@@ -161,17 +171,23 @@
       TC.tenant = v; TC.apply(); fillForm();
     };
 
-    /* Kleurkoppeling picker <-> tekstveld + live preview op elk veld */
-    var pc = document.getElementById("tcf-primaryColor");
-    var pt = document.getElementById("tcf-primaryColor-t");
-    if (pc && pt) {
-      pc.oninput = function () { pt.value = pc.value; preview(); };
-      pt.oninput = function () { if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(pt.value)) { pc.value = pt.value; } preview(); };
-    }
+    /* Kleurkoppeling picker <-> tekstveld + live preview op elke kleur */
     FIELDS.forEach(function (f) {
-      if (f.key === "primaryColor") return;
+      if (f.type !== "color") return;
+      var pc = document.getElementById("tcf-" + f.key);
+      var pt = document.getElementById("tcf-" + f.key + "-t");
+      if (pc && pt) {
+        pc.oninput = function () { pt.value = pc.value; preview(); };
+        pt.oninput = function () {
+          if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(pt.value)) { pc.value = pt.value; }
+          preview();
+        };
+      }
+    });
+    FIELDS.forEach(function (f) {
+      if (f.type === "color") return;   /* kleuren zijn hierboven al gewired */
       var el = document.getElementById("tcf-" + f.key);
-      if (el) el.oninput = preview;
+      if (el) { el.oninput = preview; el.onchange = preview; }
     });
 
     /* Logo-bestand kiezen (betrouwbaarder dan plakken) */
@@ -213,6 +229,7 @@
     FIELDS.forEach(function (f) {
       var el = document.getElementById("tcf-" + f.key);
       if (!el) return;
+      if (f.type === "checkbox") { cfg[f.key] = !!el.checked; return; }
       var v = el.value;
       if (f.key === "logo") v = normalizeLogo(v);
       cfg[f.key] = v;
@@ -236,10 +253,19 @@
     var t = TC.all();
     FIELDS.forEach(function (f) {
       var el = document.getElementById("tcf-" + f.key);
-      if (el) el.value = t[f.key] || "";
+      if (!el) return;
+      if (f.type === "checkbox") { el.checked = !!t[f.key]; return; }
+      if (f.type === "color") {
+        /* cover-kleur valt terug op de merkkleur wanneer nog niet gezet */
+        var fallback = f.key === "coverColor" ? (t.primaryColor || "#2563eb") : "#2563eb";
+        var hex = t[f.key] || fallback;
+        el.value = hex;
+        var mt = document.getElementById("tcf-" + f.key + "-t");
+        if (mt) mt.value = hex;
+      } else {
+        el.value = t[f.key] || "";
+      }
     });
-    var pt = document.getElementById("tcf-primaryColor-t");
-    if (pt) pt.value = t.primaryColor || "#2563eb";
     var sel = document.getElementById("tc-sel");
     if (sel && sel.value !== "__new__") sel.value = TC.tenant;
   }
@@ -316,15 +342,6 @@
     _originalTenant = TC.tenant;
     fillForm();
     document.getElementById("tc-admin").style.display = "flex";
-    /* Laad alle tenants uit Supabase, zodat de keuzelijst er élke toont
-       (ook die niet lokaal op dit toestel bekend zijn). */
-    try {
-      var cl = typeof global.supaInit === "function" ? global.supaInit() : null;
-      if (cl && TC.loadAll) TC.loadAll(cl).then(function () {
-        rebuildSelect(TC.tenant);
-        fillForm();
-      });
-    } catch (e) {}
   };
 
   /* Voeg het item toe aan het bestaande instellingen-dropdown (#settings-menu).
