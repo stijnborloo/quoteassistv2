@@ -22,22 +22,6 @@
   }
   var TC = global.TC;   /* zelfde object-referentie; mutaties blijven zichtbaar */
 
-  /* Voorkom dat de globale plak-/sleep-handlers van de app (voor product-
-     import) het plakken in dit configuratiescherm kapen. Vroeg geregistreerd
-     op window-capture, zodat we vóór de app-handlers komen. Bij 'paste' laten
-     we de standaardactie (plakken in het tekstvak) gewoon doorgaan. */
-  ["paste", "drop", "dragover", "dragenter"].forEach(function (type) {
-    try {
-      global.addEventListener(type, function (e) {
-        var m = document.getElementById("tc-admin");
-        if (!m || m.style.display === "none") return;
-        if (!m.contains(e.target)) return;
-        e.stopImmediatePropagation();
-        if (type !== "paste") e.preventDefault();   /* sleep: browser niet laten navigeren */
-      }, true);
-    } catch (e) {}
-  });
-
   /* Velddefinities. type: text | color | textarea | url
      hint verschijnt als kleine hulptekst onder het veld. */
   var FIELDS = [
@@ -47,12 +31,6 @@
       hint: "Vervangt overal de tekst in de app en is het woordmerk zonder eigen logo." },
     { key: "companyName",      label: "Bedrijfsnaam",     type: "text" },
     { key: "primaryColor",     label: "Merkkleur",        type: "color" },
-    { key: "coverColor",       label: "Cover-kleur",      type: "color",
-      hint: "Achtergrond van de coverpagina. Leeg/gelijk = volgt de merkkleur." },
-    { key: "logoBackdrop",     label: "Logo op wit vlak (cover)", type: "checkbox",
-      hint: "Toont een subtiel wit kader achter het cover-logo, leesbaar op elke kleur." },
-    { key: "showMraas",        label: "MRaaS-knop tonen", type: "checkbox",
-      hint: "Ricoh-specifiek. Standaard uit; enkel aanzetten voor een Ricoh-tenant." },
     { key: "website",          label: "Website",          type: "text" },
     { key: "address",          label: "Adres",            type: "textarea" },
     { key: "vatLabel",         label: "BTW-label",        type: "text" },
@@ -70,15 +48,15 @@
       hint: "Plak een <svg>…</svg> of een afbeeldings-URL. Leeg = woordmerk in de merkkleur." }
   ];
 
-  /* camelCase → snake_case voor de Supabase 'qs_tenants'-tabel */
+  /* camelCase → snake_case voor de Supabase 'tenants'-tabel */
   var DB = {
     slug: "slug", companyName: "company_name", companyNameShort: "company_name_short",
-    primaryColor: "primary_color", coverColor: "cover_color", website: "website", address: "address",
+    primaryColor: "primary_color", website: "website", address: "address",
     rszLabel: "rsz_label", rszNumber: "rsz_number", vatLabel: "vat_label",
     vatNumber: "vat_number", signingLegalUrl: "signing_legal_url",
     contactSubtitle: "contact_subtitle", pwaName: "pwa_name",
     pwaShortName: "pwa_short_name", logo: "logo_svg", logoWhite: "logo_svg_white",
-    pdfFooter: "pdf_footer", logoBackdrop: "logo_backdrop", showMraas: "show_mraas"
+    pdfFooter: "pdf_footer"
   };
 
   var _originalTenant = null;
@@ -122,10 +100,6 @@
           '" style="width:46px;height:38px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer">' +
           '<input type="text" id="' + id + '-t" value="' + esc(hex) +
           '" style="' + inputCss() + 'flex:1"></div>';
-      } else if (f.type === "checkbox") {
-        var on = TC.all()[f.key] ? " checked" : "";
-        input = '<input type="checkbox" id="' + id + '"' + on +
-          ' style="width:18px;height:18px;vertical-align:middle;cursor:pointer;margin-top:2px">';
       } else {
         input = '<input type="text" id="' + id + '" value="' + val + '" style="' + inputCss() + '">';
       }
@@ -171,47 +145,18 @@
       TC.tenant = v; TC.apply(); fillForm();
     };
 
-    /* Kleurkoppeling picker <-> tekstveld + live preview op elke kleur */
-    FIELDS.forEach(function (f) {
-      if (f.type !== "color") return;
-      var pc = document.getElementById("tcf-" + f.key);
-      var pt = document.getElementById("tcf-" + f.key + "-t");
-      if (pc && pt) {
-        pc.oninput = function () { pt.value = pc.value; preview(); };
-        pt.oninput = function () {
-          if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(pt.value)) { pc.value = pt.value; }
-          preview();
-        };
-      }
-    });
-    FIELDS.forEach(function (f) {
-      if (f.type === "color") return;   /* kleuren zijn hierboven al gewired */
-      var el = document.getElementById("tcf-" + f.key);
-      if (el) { el.oninput = preview; el.onchange = preview; }
-    });
-
-    /* Logo-bestand kiezen (betrouwbaarder dan plakken) */
-    var logoTa = document.getElementById("tcf-logo");
-    if (logoTa && !document.getElementById("tcf-logo-file")) {
-      var fi = document.createElement("input");
-      fi.type = "file";
-      fi.id = "tcf-logo-file";
-      fi.accept = ".svg,image/svg+xml,image/png,image/jpeg,image/webp,image/*";
-      fi.style.cssText = "display:block;margin-top:8px;font-size:12px;color:#475569";
-      fi.onchange = function () {
-        var f = fi.files && fi.files[0];
-        if (!f) return;
-        var rd = new FileReader();
-        if (/svg/i.test(f.type) || /\.svg$/i.test(f.name)) {
-          rd.onload = function () { logoTa.value = String(rd.result || "").trim(); preview(); };
-          rd.readAsText(f);            /* SVG als tekst → inline <svg> */
-        } else {
-          rd.onload = function () { logoTa.value = String(rd.result || ""); preview(); };
-          rd.readAsDataURL(f);         /* raster → data-URL, wordt <img> in normalizeLogo */
-        }
-      };
-      logoTa.parentNode.appendChild(fi);
+    /* Kleurkoppeling picker <-> tekstveld + live preview op elk veld */
+    var pc = document.getElementById("tcf-primaryColor");
+    var pt = document.getElementById("tcf-primaryColor-t");
+    if (pc && pt) {
+      pc.oninput = function () { pt.value = pc.value; preview(); };
+      pt.oninput = function () { if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(pt.value)) { pc.value = pt.value; } preview(); };
     }
+    FIELDS.forEach(function (f) {
+      if (f.key === "primaryColor") return;
+      var el = document.getElementById("tcf-" + f.key);
+      if (el) el.oninput = preview;
+    });
   }
 
   function inputCss() {
@@ -229,7 +174,6 @@
     FIELDS.forEach(function (f) {
       var el = document.getElementById("tcf-" + f.key);
       if (!el) return;
-      if (f.type === "checkbox") { cfg[f.key] = !!el.checked; return; }
       var v = el.value;
       if (f.key === "logo") v = normalizeLogo(v);
       cfg[f.key] = v;
@@ -253,19 +197,10 @@
     var t = TC.all();
     FIELDS.forEach(function (f) {
       var el = document.getElementById("tcf-" + f.key);
-      if (!el) return;
-      if (f.type === "checkbox") { el.checked = !!t[f.key]; return; }
-      if (f.type === "color") {
-        /* cover-kleur valt terug op de merkkleur wanneer nog niet gezet */
-        var fallback = f.key === "coverColor" ? (t.primaryColor || "#2563eb") : "#2563eb";
-        var hex = t[f.key] || fallback;
-        el.value = hex;
-        var mt = document.getElementById("tcf-" + f.key + "-t");
-        if (mt) mt.value = hex;
-      } else {
-        el.value = t[f.key] || "";
-      }
+      if (el) el.value = t[f.key] || "";
     });
+    var pt = document.getElementById("tcf-primaryColor-t");
+    if (pt) pt.value = t.primaryColor || "#2563eb";
     var sel = document.getElementById("tc-sel");
     if (sel && sel.value !== "__new__") sel.value = TC.tenant;
   }
@@ -316,7 +251,7 @@
       if (cl && cl.from) {
         var row = {};
         Object.keys(DB).forEach(function (k) { if (cfg[k] != null) row[DB[k]] = cfg[k]; });
-        var res = await cl.from("qs_tenants").upsert(row, { onConflict: "slug" });
+        var res = await cl.from("tenants").upsert(row, { onConflict: "slug" });
         if (res && res.error) throw new Error(res.error.message);
         saved = "Supabase + lokaal";
       }
@@ -344,25 +279,6 @@
     document.getElementById("tc-admin").style.display = "flex";
   };
 
-  /* Voeg het item toe aan het bestaande instellingen-dropdown (#settings-menu).
-     Geeft true wanneer het menu bestaat en het item aanwezig is. */
-  function injectMenuItem() {
-    var menu = document.getElementById("settings-menu");
-    if (!menu) return false;
-    if (menu.querySelector("[data-tc-menu]")) return true;   /* al aanwezig */
-    var block = document.createElement("div");
-    block.setAttribute("data-tc-menu", "");
-    block.innerHTML =
-      '<div class="sm-label">White-label</div>' +
-      '<button type="button" class="sm-item" data-no-brand ' +
-        'onclick="openTenantConfig();(window.closeSettings||function(){})()">' +
-        '<span class="sm-icon">&#9881;</span>Tenant-instellingen</button>' +
-      '<div class="sm-div"></div>';
-    menu.insertBefore(block, menu.firstChild);
-    return true;
-  }
-
-  /* Zwevende knop — enkel als terugvaloptie wanneer het menu niet bestaat */
   function addFloatingButton() {
     if (!document.body) return;
     if (document.getElementById("tc-fab")) return;
@@ -371,7 +287,7 @@
     b.type = "button";
     b.setAttribute("data-no-brand", "");
     b.title = "Tenant-instellingen";
-    b.innerHTML = "&#9881;";
+    b.innerHTML = "&#9881;"; /* tandwiel */
     b.style.cssText =
       "position:fixed;right:16px;bottom:16px;z-index:2147483000;width:46px;height:46px;border-radius:50%;" +
       "border:none;background:#0f172a;color:#fff;font-size:20px;cursor:pointer;" +
@@ -380,26 +296,17 @@
     document.body.appendChild(b);
   }
 
-  /* Zorg voor precies één ingang: menu-item indien mogelijk, anders de knop.
-     Herhaalt zich, zodat een herrender van de app het item terugzet. */
-  function ensureEntry() {
-    if (injectMenuItem()) {
-      var fab = document.getElementById("tc-fab");
-      if (fab) fab.parentNode && fab.parentNode.removeChild(fab);
-    } else {
-      addFloatingButton();
-    }
-  }
-
-  function startEntry() {
-    ensureEntry();
-    try { setInterval(ensureEntry, 1500); } catch (e) {}
+  /* Zelfherstel: als de app de body herrendert en de knop wegvalt,
+     zetten we hem terug. Goedkoop en betrouwbaar. */
+  function startFab() {
+    addFloatingButton();
+    try { setInterval(addFloatingButton, 1500); } catch (e) {}
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", startEntry);
+    document.addEventListener("DOMContentLoaded", startFab);
   } else {
-    startEntry();
+    startFab();
   }
 
 })(typeof window !== "undefined" ? window : this);
