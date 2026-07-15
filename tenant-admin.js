@@ -22,6 +22,22 @@
   }
   var TC = global.TC;   /* zelfde object-referentie; mutaties blijven zichtbaar */
 
+  /* Voorkom dat de globale plak-/sleep-handlers van de app (voor product-
+     import) het plakken in dit configuratiescherm kapen. Vroeg geregistreerd
+     op window-capture, zodat we vóór de app-handlers komen. Bij 'paste' laten
+     we de standaardactie (plakken in het tekstvak) gewoon doorgaan. */
+  ["paste", "drop", "dragover", "dragenter"].forEach(function (type) {
+    try {
+      global.addEventListener(type, function (e) {
+        var m = document.getElementById("tc-admin");
+        if (!m || m.style.display === "none") return;
+        if (!m.contains(e.target)) return;
+        e.stopImmediatePropagation();
+        if (type !== "paste") e.preventDefault();   /* sleep: browser niet laten navigeren */
+      }, true);
+    } catch (e) {}
+  });
+
   /* Velddefinities. type: text | color | textarea | url
      hint verschijnt als kleine hulptekst onder het veld. */
   var FIELDS = [
@@ -48,7 +64,7 @@
       hint: "Plak een <svg>…</svg> of een afbeeldings-URL. Leeg = woordmerk in de merkkleur." }
   ];
 
-  /* camelCase → snake_case voor de Supabase 'tenants'-tabel */
+  /* camelCase → snake_case voor de Supabase 'qs_tenants'-tabel */
   var DB = {
     slug: "slug", companyName: "company_name", companyNameShort: "company_name_short",
     primaryColor: "primary_color", website: "website", address: "address",
@@ -157,6 +173,29 @@
       var el = document.getElementById("tcf-" + f.key);
       if (el) el.oninput = preview;
     });
+
+    /* Logo-bestand kiezen (betrouwbaarder dan plakken) */
+    var logoTa = document.getElementById("tcf-logo");
+    if (logoTa && !document.getElementById("tcf-logo-file")) {
+      var fi = document.createElement("input");
+      fi.type = "file";
+      fi.id = "tcf-logo-file";
+      fi.accept = ".svg,image/svg+xml,image/png,image/jpeg,image/webp,image/*";
+      fi.style.cssText = "display:block;margin-top:8px;font-size:12px;color:#475569";
+      fi.onchange = function () {
+        var f = fi.files && fi.files[0];
+        if (!f) return;
+        var rd = new FileReader();
+        if (/svg/i.test(f.type) || /\.svg$/i.test(f.name)) {
+          rd.onload = function () { logoTa.value = String(rd.result || "").trim(); preview(); };
+          rd.readAsText(f);            /* SVG als tekst → inline <svg> */
+        } else {
+          rd.onload = function () { logoTa.value = String(rd.result || ""); preview(); };
+          rd.readAsDataURL(f);         /* raster → data-URL, wordt <img> in normalizeLogo */
+        }
+      };
+      logoTa.parentNode.appendChild(fi);
+    }
   }
 
   function inputCss() {
@@ -251,7 +290,7 @@
       if (cl && cl.from) {
         var row = {};
         Object.keys(DB).forEach(function (k) { if (cfg[k] != null) row[DB[k]] = cfg[k]; });
-        var res = await cl.from("tenants").upsert(row, { onConflict: "slug" });
+        var res = await cl.from("qs_tenants").upsert(row, { onConflict: "slug" });
         if (res && res.error) throw new Error(res.error.message);
         saved = "Supabase + lokaal";
       }
@@ -279,6 +318,25 @@
     document.getElementById("tc-admin").style.display = "flex";
   };
 
+  /* Voeg het item toe aan het bestaande instellingen-dropdown (#settings-menu).
+     Geeft true wanneer het menu bestaat en het item aanwezig is. */
+  function injectMenuItem() {
+    var menu = document.getElementById("settings-menu");
+    if (!menu) return false;
+    if (menu.querySelector("[data-tc-menu]")) return true;   /* al aanwezig */
+    var block = document.createElement("div");
+    block.setAttribute("data-tc-menu", "");
+    block.innerHTML =
+      '<div class="sm-label">White-label</div>' +
+      '<button type="button" class="sm-item" data-no-brand ' +
+        'onclick="openTenantConfig();(window.closeSettings||function(){})()">' +
+        '<span class="sm-icon">&#9881;</span>Tenant-instellingen</button>' +
+      '<div class="sm-div"></div>';
+    menu.insertBefore(block, menu.firstChild);
+    return true;
+  }
+
+  /* Zwevende knop — enkel als terugvaloptie wanneer het menu niet bestaat */
   function addFloatingButton() {
     if (!document.body) return;
     if (document.getElementById("tc-fab")) return;
@@ -287,7 +345,7 @@
     b.type = "button";
     b.setAttribute("data-no-brand", "");
     b.title = "Tenant-instellingen";
-    b.innerHTML = "&#9881;"; /* tandwiel */
+    b.innerHTML = "&#9881;";
     b.style.cssText =
       "position:fixed;right:16px;bottom:16px;z-index:2147483000;width:46px;height:46px;border-radius:50%;" +
       "border:none;background:#0f172a;color:#fff;font-size:20px;cursor:pointer;" +
@@ -296,17 +354,26 @@
     document.body.appendChild(b);
   }
 
-  /* Zelfherstel: als de app de body herrendert en de knop wegvalt,
-     zetten we hem terug. Goedkoop en betrouwbaar. */
-  function startFab() {
-    addFloatingButton();
-    try { setInterval(addFloatingButton, 1500); } catch (e) {}
+  /* Zorg voor precies één ingang: menu-item indien mogelijk, anders de knop.
+     Herhaalt zich, zodat een herrender van de app het item terugzet. */
+  function ensureEntry() {
+    if (injectMenuItem()) {
+      var fab = document.getElementById("tc-fab");
+      if (fab) fab.parentNode && fab.parentNode.removeChild(fab);
+    } else {
+      addFloatingButton();
+    }
+  }
+
+  function startEntry() {
+    ensureEntry();
+    try { setInterval(ensureEntry, 1500); } catch (e) {}
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", startFab);
+    document.addEventListener("DOMContentLoaded", startEntry);
   } else {
-    startFab();
+    startEntry();
   }
 
 })(typeof window !== "undefined" ? window : this);
