@@ -1,302 +1,353 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   invoice.js — Facturatie-uitbreiding voor QuoteStudio
+   invoice.js — QuoteStudio Facturatie-module (Quote-to-Cash)
    ───────────────────────────────────────────────────────────────────────
-   Laden ná tenant-config.js:
-       <script src="tenant-config.js"></script>
-       <script src="invoice.js"></script>
-
-   Vereist qs_invoices.sql (RPC's qs_create_invoice + qs_attach_invoice_html)
-   en window.supaInit() dat een supabase-js client teruggeeft (zelfde bron als
-   tenant-admin.js).
-
-   Publieke API (window.Invoice):
-     Invoice.createFromQuote(quote)   → maakt de factuur aan in Supabase en
-                                        geeft de factuurrij terug (incl. nummer,
-                                        vervaldatum en gestructureerde mededeling).
-     Invoice.buildHtml(invoiceRow)    → volledige factuur-HTML (string) met de
-                                        tenant-branding uit TC.
-     Invoice.createAndPreview(quote)  → doet createFromQuote en opent de factuur
-                                        in een nieuw venster (Ctrl/Cmd-P = PDF).
-
-   ── quote-object (jij mapt je interne offerte-state hierop) ──────────────
-     {
-       source:   "signing-page-id of offerte-id",          // optioneel
-       customer: { name, address, vatNumber, email },       // vrij, wordt als
-                                                            //   snapshot bewaard
-       lineItems: [ { description, qty, unitPrice, total } ],// total optioneel
-       subtotal:  1000.00,     // excl. btw
-       vat:        210.00,     // btw-bedrag
-       total:     1210.00      // incl. btw
-     }
+   Laad ná tenant-config.js en vóór invoice-dashboard.js / invoices-panel.js.
+   Verwacht: supaInit(), supaConfigured(), TC, esc(), toast(), fE() uit index.html.
    ═══════════════════════════════════════════════════════════════════════ */
-(function (global) {
+(function(global){
   "use strict";
 
-  if (typeof global.TC === "undefined") {
-    console.warn("[invoice] TC ontbreekt — laad tenant-config.js eerst.");
-    return;
-  }
-  var TC = global.TC;
+  /* ─── helpers beschikbaar vanuit index.html ─── */
+  function _esc(s){ return typeof global.esc==="function"?global.esc(s):String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+  function _toast(m){ if(typeof global.toast==="function") global.toast(m); else console.log("[invoice]",m); }
+  function _fE(n){ return typeof global.fE==="function"?global.fE(n):("€\u00a0"+Number(n||0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,".")); }
+  function _tenantId(){ try{ var u=global.supaInit&&global.supaInit(); if(!u) return ""; var s=u.auth; /* fallback */ return (global.TC&&global.TC.tenant)||"default"; }catch(e){ return "default"; } }
 
-  /* Tenant-factuurinstelling met fallback (uit qs_tenants / TC.all()) */
-  function cfg(key, fallback) {
-    var v = TC.all()[key];
-    return (v == null || v === "") ? fallback : v;
-  }
-
-  function esc(s) {
-    return String(s == null ? "" : s)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-  }
-  function euro(n) {
-    try { return new Intl.NumberFormat("nl-BE", { style: "currency", currency: "EUR" }).format(Number(n) || 0); }
-    catch (e) { return "€ " + (Number(n) || 0).toFixed(2); }
-  }
-  function dmy(d) {
-    if (!d) return "";
-    try { return new Date(d).toLocaleDateString("nl-BE"); } catch (e) { return String(d); }
-  }
-  function nl2br(s) { return esc(s).replace(/\n/g, "<br>"); }
-
-  function supa() {
-    var cl = typeof global.supaInit === "function" ? global.supaInit() : null;
-    if (!cl || !cl.rpc) throw new Error("Supabase-client ontbreekt (window.supaInit).");
-    return cl;
+  /* ─── Gestructureerde mededeling (Belgisch OGM-formaat) ─── */
+  function _ogm(){
+    var r=Math.floor(Math.random()*9000000000)+1000000000;
+    var mod=r%97; if(mod===0) mod=97;
+    return "+++"+String(r).replace(/(\d{3})(\d{4})(\d{3})/,"$1/$2/$3")+String(mod).padStart(2,"0")+"+++";
   }
 
-  /* ── Factuur aanmaken (nummer + snapshot komen uit de RPC) ─────────────── */
-  async function createFromQuote(quote) {
-    quote = quote || {};
-    var cl = supa();
+  /* ═══════════════════════════════════════════════════════════════
+     API — CRUD via Supabase
+     ═══════════════════════════════════════════════════════════════ */
 
-    var res = await cl.rpc("qs_create_invoice", {
-      p_tenant:     TC.tenant,
-      p_source:     quote.source || null,
-      p_customer:   quote.customer || {},
-      p_line_items: quote.lineItems || [],
-      p_subtotal:   Number(quote.subtotal) || 0,
-      p_vat:        Number(quote.vat) || 0,
-      p_total:      Number(quote.total) || 0,
-      p_due_days:   Number(cfg("paymentTermDays", 30)),
-      p_prefix:     cfg("invoicePrefix", "")
+  /** Maak factuur vanuit een getekende/gewonnen offerte.
+   *  @param {object} quoteSession  — volledige quote-sessiedata
+   *  @param {string} quoteDbId     — UUID van de quotes-rij
+   *  @returns {object} invoice-rij
+   */
+  async function createInvoiceFromQuote(quoteSession, quoteDbId){
+    var cl=global.supaInit(); if(!cl) throw new Error("Supabase niet beschikbaar");
+    var tid=_tenantId();
+
+    // 1. Factuurnummer ophalen (RPC)
+    var nr=await cl.rpc("next_invoice_number",{p_tenant:tid});
+    if(nr.error) throw new Error(nr.error.message);
+    var invNum=nr.data;
+
+    // 2. Bedragen berekenen uit sessiedata
+    var s=quoteSession||{};
+    var items=[];
+    (s.zalen||[]).forEach(function(z){
+      (z.items||[]).forEach(function(it){
+        if(it.optional) return; // optionele items niet factureren
+        items.push({
+          description: it.name||"",
+          reference:   it.ref||"",
+          quantity:    Number(it.qty)||1,
+          unit_price:  Number(it.price)||0,
+          room_name:   z.name||""
+        });
+      });
     });
-    if (res.error) throw new Error("Factuur aanmaken mislukt: " + res.error.message);
 
-    var invoice = res.data;
+    var subtotal=items.reduce(function(a,it){ return a+(it.quantity*it.unit_price); },0);
+    var discPct=Number(s.discount&&s.discount.pct)||0;
+    var discAmt=Math.round(subtotal*discPct)/100;
+    var net=subtotal-discAmt;
+    var taxPct=21; // configureerbaar per tenant later
+    var taxAmt=Math.round(net*taxPct)/100;
+    var total=net+taxAmt;
 
-    /* HTML-snapshot renderen en (write-once) terugkoppelen */
-    try {
-      var html = buildHtml(invoice);
-      var att = await cl.rpc("qs_attach_invoice_html", { p_id: invoice.id, p_html: html });
-      if (!att.error) invoice.html_content = html;
-    } catch (e) {
-      console.warn("[invoice] HTML-snapshot niet bewaard:", e && e.message);
+    // 3. Gebruiker
+    var u=await cl.auth.getUser();
+    var email=(u&&u.data&&u.data.user)?u.data.user.email:"";
+
+    // 4. Due date (+30 dagen)
+    var due=new Date(); due.setDate(due.getDate()+30);
+
+    // 5. Insert factuur
+    var inv={
+      quote_id:       quoteDbId||null,
+      invoice_number: invNum,
+      status:         "draft",
+      client_name:    s.clientCo||s.client||"",
+      client_address: s.clientAddr||"",
+      client_email:   s.clientEmail||"",
+      client_vat:     s.clientVat||"",
+      contact_name:   (s.contacts&&s.contacts[0]&&s.contacts[0].name)||"",
+      project_name:   s.projectName||"",
+      subtotal:       subtotal,
+      discount_pct:   discPct,
+      discount_amt:   discAmt,
+      tax_pct:        taxPct,
+      tax_amt:        taxAmt,
+      total_incl:     total,
+      invoice_date:   new Date().toISOString().slice(0,10),
+      due_date:       due.toISOString().slice(0,10),
+      payment_ref:    _ogm(),
+      user_email:     email,
+      notes:          ""
+    };
+
+    var res=await cl.from("invoices").insert(inv).select().single();
+    if(res.error) throw new Error(res.error.message);
+    var invoiceRow=res.data;
+
+    // 6. Insert factuurlijnen
+    if(items.length){
+      var lines=items.map(function(it,i){
+        return {
+          invoice_id:  invoiceRow.id,
+          sort_order:  i,
+          description: it.description,
+          reference:   it.reference,
+          quantity:    it.quantity,
+          unit_price:  it.unit_price,
+          room_name:   it.room_name
+        };
+      });
+      var lr=await cl.from("invoice_lines").insert(lines);
+      if(lr.error) console.warn("Factuurlijnen fout:",lr.error.message);
     }
-    return invoice;
+
+    // 7. Audit event
+    await cl.from("invoice_events").insert({
+      invoice_id: invoiceRow.id,
+      event_type: "created",
+      user_email: email,
+      note: "Factuur aangemaakt vanuit offerte "+invNum
+    });
+
+    return invoiceRow;
   }
 
-  /* ── HTML-template — hergebruikt TC-branding (logo, kleur, voettekst) ──── */
-  function buildHtml(invoice) {
-    invoice = invoice || {};
-    var t         = TC.all();
-    var color     = t.primaryColor || "#2563eb";
-    var cust      = invoice.customer || {};
-    var items     = Array.isArray(invoice.line_items) ? invoice.line_items : [];
+  /** Factuur ophalen met lijnen */
+  async function getInvoice(invoiceId){
+    var cl=global.supaInit(); if(!cl) throw new Error("Supabase niet beschikbaar");
+    var res=await cl.from("invoices").select("*").eq("id",invoiceId).single();
+    if(res.error) throw new Error(res.error.message);
+    var inv=res.data;
+    var lr=await cl.from("invoice_lines").select("*").eq("invoice_id",invoiceId).order("sort_order");
+    inv.lines=lr.data||[];
+    return inv;
+  }
 
-    var rows = items.map(function (it) {
-      var qty  = Number(it.qty != null ? it.qty : 1) || 0;
-      var unit = Number(it.unitPrice != null ? it.unitPrice : 0) || 0;
-      var line = it.total != null ? Number(it.total) : qty * unit;
-      return (
-        '<tr>' +
-          '<td style="padding:9px 10px;border-bottom:1px solid #eef2f7">' + esc(it.description || "") + '</td>' +
-          '<td style="padding:9px 10px;border-bottom:1px solid #eef2f7;text-align:right;white-space:nowrap">' + esc(qty) + '</td>' +
-          '<td style="padding:9px 10px;border-bottom:1px solid #eef2f7;text-align:right;white-space:nowrap">' + euro(unit) + '</td>' +
-          '<td style="padding:9px 10px;border-bottom:1px solid #eef2f7;text-align:right;white-space:nowrap;font-weight:600">' + euro(line) + '</td>' +
-        '</tr>'
-      );
-    }).join("");
+  /** Alle facturen ophalen */
+  async function listInvoices(filters){
+    var cl=global.supaInit(); if(!cl) throw new Error("Supabase niet beschikbaar");
+    var q=cl.from("invoices").select("*").order("created_at",{ascending:false}).limit(100);
+    if(filters&&filters.status) q=q.eq("status",filters.status);
+    var res=await q;
+    if(res.error) throw new Error(res.error.message);
+    return res.data||[];
+  }
 
-    function totalRow(label, value, strong) {
-      return (
-        '<tr>' +
-          '<td style="padding:6px 10px;text-align:right;color:#64748b">' + esc(label) + '</td>' +
-          '<td style="padding:6px 10px;text-align:right;white-space:nowrap;min-width:120px;' +
-            (strong ? 'font-weight:800;font-size:15px;color:' + color : 'font-weight:600') + '">' +
-            euro(value) + '</td>' +
-        '</tr>'
-      );
+  /** Status updaten */
+  async function updateInvoiceStatus(invoiceId, newStatus, note){
+    var cl=global.supaInit(); if(!cl) throw new Error("Supabase niet beschikbaar");
+    var upd={status:newStatus, updated_at:new Date().toISOString()};
+    if(newStatus==="paid") upd.paid_date=new Date().toISOString().slice(0,10);
+    var res=await cl.from("invoices").update(upd).eq("id",invoiceId);
+    if(res.error) throw new Error(res.error.message);
+    var u=await cl.auth.getUser();
+    var email=(u&&u.data&&u.data.user)?u.data.user.email:"";
+    await cl.from("invoice_events").insert({
+      invoice_id:invoiceId, event_type:newStatus, user_email:email,
+      note: note||("Status → "+newStatus)
+    });
+  }
+
+  /** Factuur verwijderen (enkel draft) */
+  async function deleteInvoice(invoiceId){
+    var cl=global.supaInit(); if(!cl) throw new Error("Supabase niet beschikbaar");
+    // Verwijder lijnen eerst (cascade zou moeten werken, maar veiligheidshalve)
+    await cl.from("invoice_lines").delete().eq("invoice_id",invoiceId);
+    await cl.from("invoice_events").delete().eq("invoice_id",invoiceId);
+    var res=await cl.from("invoices").delete().eq("id",invoiceId);
+    if(res.error) throw new Error(res.error.message);
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     PDF GENERATIE — Factuur als HTML → html2pdf
+     ═══════════════════════════════════════════════════════════════ */
+
+  function generateInvoiceHTML(inv){
+    var lines=inv.lines||[];
+    var logoH=TC.logoPdf(Number(TC.get("coverLogoSize"))||34);
+
+    var linesHTML=lines.map(function(l,i){
+      return '<tr style="border-bottom:1px solid #eee">'
+        +'<td style="padding:8px 10px;font-size:11px">'+(i+1)+'</td>'
+        +'<td style="padding:8px 10px;font-size:11px">'+_esc(l.description)+(l.room_name?' <span style="color:#999;font-size:10px">('+_esc(l.room_name)+')</span>':'')+'</td>'
+        +'<td style="padding:8px 10px;font-size:11px">'+_esc(l.reference||'')+'</td>'
+        +'<td style="padding:8px 10px;font-size:11px;text-align:center">'+Number(l.quantity)+'</td>'
+        +'<td style="padding:8px 10px;font-size:11px;text-align:right">'+_fE(l.unit_price)+'</td>'
+        +'<td style="padding:8px 10px;font-size:11px;text-align:right;font-weight:600">'+_fE(l.line_total||l.quantity*l.unit_price)+'</td>'
+        +'</tr>';
+    }).join('');
+
+    var discRow='';
+    if(Number(inv.discount_pct)>0){
+      discRow='<tr><td colspan="5" style="text-align:right;padding:6px 10px;font-size:11px;color:#c0392b">Korting (-'+inv.discount_pct+'%)</td>'
+        +'<td style="text-align:right;padding:6px 10px;font-size:11px;color:#c0392b">-'+_fE(inv.discount_amt)+'</td></tr>';
     }
 
-    var vatNumber = cfg("vatNumber", "");
-    var iban      = cfg("iban", "");
-    var bic       = cfg("bic", "");
-    var legal     = cfg("invoiceLegalText", "");
+    return '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+      +'<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:Inter,Arial,sans-serif;color:#1e293b;padding:40px}'
+      +'table{width:100%;border-collapse:collapse}'
+      +'th{background:#f8fafc;border-bottom:2px solid #e2e8f0;padding:8px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#64748b;text-align:left}'
+      +'.hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:30px}'
+      +'.badge{display:inline-block;padding:4px 12px;border-radius:99px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}'
+      +'</style></head><body>'
+      +'<div class="hdr"><div>'+logoH+'</div>'
+      +'<div style="text-align:right"><div style="font-size:22px;font-weight:800;letter-spacing:-1px">FACTUUR</div>'
+      +'<div style="font-size:13px;margin-top:4px;color:#64748b">'+_esc(inv.invoice_number)+'</div>'
+      +'<div class="badge" style="background:#E3F2FD;color:#1565C0;margin-top:8px">'+_esc(inv.status.toUpperCase())+'</div>'
+      +'</div></div>'
 
-    return (
-'<!DOCTYPE html><html lang="nl"><head><meta charset="UTF-8">' +
-'<meta name="viewport" content="width=device-width,initial-scale=1">' +
-'<title>Factuur ' + esc(invoice.invoice_number || "") + '</title></head>' +
-'<body style="margin:0;font-family:Inter,Arial,sans-serif;color:#0f172a;background:#fff">' +
-'<div style="max-width:800px;margin:0 auto;padding:40px 44px">' +
+      +'<div style="display:flex;gap:40px;margin-bottom:30px">'
+      +'<div style="flex:1"><div style="font-size:10px;text-transform:uppercase;color:#94a3b8;font-weight:700;margin-bottom:6px">Van</div>'
+      +'<div style="font-size:12px;font-weight:600">'+_esc(TC.get("companyName"))+'</div>'
+      +'<div style="font-size:11px;color:#64748b;white-space:pre-line">'+_esc(TC.get("address"))+'</div>'
+      +(TC.get("vatNumber")?'<div style="font-size:10px;color:#94a3b8;margin-top:4px">'+_esc(TC.get("vatLabel"))+': '+_esc(TC.get("vatNumber"))+'</div>':'')
+      +'</div>'
+      +'<div style="flex:1"><div style="font-size:10px;text-transform:uppercase;color:#94a3b8;font-weight:700;margin-bottom:6px">Aan</div>'
+      +'<div style="font-size:12px;font-weight:600">'+_esc(inv.client_name)+'</div>'
+      +'<div style="font-size:11px;color:#64748b;white-space:pre-line">'+_esc(inv.client_address)+'</div>'
+      +(inv.client_vat?'<div style="font-size:10px;color:#94a3b8;margin-top:4px">BTW: '+_esc(inv.client_vat)+'</div>':'')
+      +'</div>'
+      +'<div><div style="font-size:10px;text-transform:uppercase;color:#94a3b8;font-weight:700;margin-bottom:6px">Details</div>'
+      +'<div style="font-size:11px"><strong>Datum:</strong> '+_esc(inv.invoice_date)+'</div>'
+      +'<div style="font-size:11px"><strong>Vervaldatum:</strong> '+_esc(inv.due_date||"—")+'</div>'
+      +(inv.project_name?'<div style="font-size:11px"><strong>Project:</strong> '+_esc(inv.project_name)+'</div>':'')
+      +'</div></div>'
 
-  /* Kop: logo links, factuurblok rechts */
-  '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:24px;margin-bottom:32px">' +
-    '<div style="height:44px">' + TC.logoPdf() + '</div>' +
-    '<div style="text-align:right">' +
-      '<div style="font-size:24px;font-weight:800;letter-spacing:-.5px;color:' + color + '">FACTUUR</div>' +
-      '<div style="font-size:13px;color:#334155;margin-top:6px">Nr. <b>' + esc(invoice.invoice_number || "") + '</b></div>' +
-      '<div style="font-size:12px;color:#64748b">Datum: ' + dmy(invoice.issue_date) + '</div>' +
-      '<div style="font-size:12px;color:#64748b">Vervaldatum: ' + dmy(invoice.due_date) + '</div>' +
-    '</div>' +
-  '</div>' +
+      +'<table>'
+      +'<thead><tr><th style="width:5%">#</th><th style="width:38%">Omschrijving</th><th style="width:15%">Ref</th><th style="width:8%;text-align:center">Qty</th><th style="width:15%;text-align:right">Eenheidsprijs</th><th style="width:19%;text-align:right">Totaal</th></tr></thead>'
+      +'<tbody>'+linesHTML+'</tbody>'
+      +'<tfoot>'
+      +'<tr><td colspan="5" style="text-align:right;padding:8px 10px;font-size:11px">Subtotaal</td><td style="text-align:right;padding:8px 10px;font-size:11px;font-weight:600">'+_fE(inv.subtotal)+'</td></tr>'
+      +discRow
+      +'<tr><td colspan="5" style="text-align:right;padding:6px 10px;font-size:11px">BTW '+inv.tax_pct+'%</td><td style="text-align:right;padding:6px 10px;font-size:11px">'+_fE(inv.tax_amt)+'</td></tr>'
+      +'<tr style="background:'+TC.get("primaryColor")+'"><td colspan="5" style="text-align:right;padding:10px;font-size:12px;font-weight:700;color:#fff">Totaal incl. BTW</td><td style="text-align:right;padding:10px;font-size:13px;font-weight:800;color:#fff">'+_fE(inv.total_incl)+'</td></tr>'
+      +'</tfoot></table>'
 
-  /* Van / Aan */
-  '<div style="display:flex;justify-content:space-between;gap:24px;margin-bottom:28px;font-size:12.5px;line-height:1.55">' +
-    '<div>' +
-      '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#94a3b8;margin-bottom:4px">Van</div>' +
-      '<div style="font-weight:700">' + esc(t.companyName || t.companyNameShort || "") + '</div>' +
-      (t.address ? '<div style="color:#475569">' + nl2br(t.address) + '</div>' : '') +
-      (vatNumber ? '<div style="color:#475569">' + esc(t.vatLabel || "BTW") + ': ' + esc(vatNumber) + '</div>' : '') +
-      (t.website ? '<div style="color:#475569">' + esc(t.website) + '</div>' : '') +
-    '</div>' +
-    '<div style="text-align:right">' +
-      '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#94a3b8;margin-bottom:4px">Aan</div>' +
-      '<div style="font-weight:700">' + esc(cust.name || "") + '</div>' +
-      (cust.address ? '<div style="color:#475569">' + nl2br(cust.address) + '</div>' : '') +
-      (cust.vatNumber ? '<div style="color:#475569">BTW: ' + esc(cust.vatNumber) + '</div>' : '') +
-      (cust.email ? '<div style="color:#475569">' + esc(cust.email) + '</div>' : '') +
-    '</div>' +
-  '</div>' +
+      +(inv.payment_ref?'<div style="margin-top:24px;padding:14px 18px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0">'
+      +'<div style="font-size:10px;text-transform:uppercase;color:#94a3b8;font-weight:700;margin-bottom:4px">Betalingsreferentie</div>'
+      +'<div style="font-size:16px;font-weight:700;font-family:monospace;letter-spacing:1px">'+_esc(inv.payment_ref)+'</div>'
+      +'</div>':'')
 
-  /* Lijnen */
-  '<table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:8px">' +
-    '<thead><tr style="background:' + color + ';color:#fff">' +
-      '<th style="padding:10px;text-align:left;font-weight:600">Omschrijving</th>' +
-      '<th style="padding:10px;text-align:right;font-weight:600;white-space:nowrap">Aantal</th>' +
-      '<th style="padding:10px;text-align:right;font-weight:600;white-space:nowrap">Eenheidsprijs</th>' +
-      '<th style="padding:10px;text-align:right;font-weight:600;white-space:nowrap">Totaal</th>' +
-    '</tr></thead>' +
-    '<tbody>' + (rows || '<tr><td colspan="4" style="padding:14px;color:#94a3b8">Geen lijnen</td></tr>') + '</tbody>' +
-  '</table>' +
+      +(inv.notes?'<div style="margin-top:16px;font-size:11px;color:#64748b"><strong>Opmerkingen:</strong> '+_esc(inv.notes)+'</div>':'')
 
-  /* Totalen */
-  '<div style="display:flex;justify-content:flex-end;margin-bottom:28px">' +
-    '<table style="border-collapse:collapse;font-size:13px">' +
-      totalRow("Subtotaal (excl. btw)", invoice.subtotal) +
-      totalRow("Btw", invoice.vat_amount) +
-      totalRow("Totaal te betalen", invoice.total, true) +
-    '</table>' +
-  '</div>' +
-
-  /* Betaalblok */
-  '<div style="background:#f8fafc;border:1px solid #eef2f7;border-radius:12px;padding:16px 18px;font-size:12.5px;line-height:1.6;margin-bottom:24px">' +
-    '<div style="font-weight:700;color:' + color + ';margin-bottom:6px">Betaalgegevens</div>' +
-    (iban ? '<div>IBAN: <b>' + esc(iban) + '</b>' + (bic ? '&nbsp;&nbsp;BIC: ' + esc(bic) : '') + '</div>' : '') +
-    (invoice.structured_comm ? '<div>Gestructureerde mededeling: <b>' + esc(invoice.structured_comm) + '</b></div>' : '') +
-    '<div>Te betalen vóór <b>' + dmy(invoice.due_date) + '</b> — bedrag: <b>' + euro(invoice.total) + '</b></div>' +
-  '</div>' +
-
-  (legal ? '<div style="font-size:10.5px;color:#94a3b8;line-height:1.5;margin-bottom:18px">' + nl2br(legal) + '</div>' : '') +
-
-  /* Voettekst uit TC */
-  '<div style="border-top:1px solid #eef2f7;padding-top:12px;font-size:10.5px;color:#94a3b8;text-align:center">' +
-    esc(TC.pdfFooter()) +
-  '</div>' +
-
-'</div></body></html>'
-    );
+      +'<div style="margin-top:40px;padding-top:12px;border-top:1px solid #e2e8f0;font-size:9px;color:#94a3b8;text-align:center">'
+      +TC.pdfFooter()
+      +'</div>'
+      +'</body></html>';
   }
 
-  /* ── Aanmaken + openen voor print/PDF (fallback-pipeline) ──────────────── */
-  async function createAndPreview(quote) {
-    var invoice = await createFromQuote(quote);
-    var html = invoice.html_content || buildHtml(invoice);
-    try {
-      var w = global.open("", "_blank");
-      if (w) { w.document.open(); w.document.write(html); w.document.close(); }
-    } catch (e) { console.warn("[invoice] preview-venster geblokkeerd:", e && e.message); }
-    return invoice;
+  /** Download factuur-PDF via html2pdf */
+  async function downloadInvoicePDF(invoiceId){
+    _toast("⏳ PDF genereren…");
+    var inv=await getInvoice(invoiceId);
+    var html=generateInvoiceHTML(inv);
+
+    var container=document.createElement("div");
+    container.style.cssText="position:fixed;left:-9999px;top:0;width:794px";
+    container.innerHTML=html;
+    document.body.appendChild(container);
+
+    try{
+      var opt={
+        margin:[10,10,10,10],
+        filename: (inv.invoice_number||"factuur")+".pdf",
+        image:{type:"jpeg",quality:0.95},
+        html2canvas:{scale:2,useCORS:true},
+        jsPDF:{unit:"mm",format:"a4",orientation:"portrait"}
+      };
+      await html2pdf().set(opt).from(container).save();
+      _toast("✓ PDF gedownload");
+    }finally{
+      document.body.removeChild(container);
+    }
   }
 
-  /* ── Bestaande factuur voor een offerte opzoeken ──────────────────────── */
-  /*    Voorkomt dubbele facturatie: één getekende offerte → één factuur.     */
-  async function findBySource(sourceId) {
-    if (!sourceId) return null;
-    var cl = supa();
-    var res = await cl.from("qs_invoices")
-      .select("*")
-      .eq("tenant_slug", TC.tenant)
-      .eq("source_quote_id", sourceId)
-      .order("created_at", { ascending: false })
-      .limit(1);
-    if (res.error) throw new Error(res.error.message);
-    return (res.data && res.data[0]) || null;
-  }
 
-  function openHtml(html) {
-    try {
-      var w = global.open("", "_blank");
-      if (w) { w.document.open(); w.document.write(html); w.document.close(); }
-    } catch (e) { console.warn("[invoice] venster geblokkeerd:", e && e.message); }
-  }
+  /* ═══════════════════════════════════════════════════════════════
+     Snelle factuur vanuit huidige sessie (één klik)
+     ═══════════════════════════════════════════════════════════════ */
 
-  /* ── Knop-helper: "Maak factuur" / "Factuur <nr>" ─────────────────────────
-     opts:
-       sourceId  : id van de offerte/signing-page (koppeling + dubbel-preventie)
-       getQuote  : () => quote-object (of async), opgeroepen bij klik
-       quote     : alternatief voor getQuote (statisch object)
-       onDone    : (invoice) => {}  callback na aanmaken
-       style     : inline-CSS voor de knop (optioneel)
-       className : class voor de knop (optioneel)
-     Geeft het knop-element terug. Bestaat er al een factuur, dan toont de knop
-     meteen "Factuur <nr>" en opent hij bij klik de snapshot. */
-  function mountButton(container, opts) {
-    opts = opts || {};
-    if (!container) return null;
-    var btn = document.createElement("button");
-    btn.type = "button";
-    if (opts.className) btn.className = opts.className;
-    if (opts.style) btn.style.cssText = opts.style;
-    var busy = false;
+  /** Wordt aangeroepen vanuit de UI: factuur genereren vanuit actieve offerte */
+  async function quickInvoiceFromCurrentQuote(){
+    if(!global.supaConfigured||!global.supaConfigured()){
+      _toast("⚠ Supabase niet geconfigureerd"); return;
+    }
+    // Sessiedata ophalen (zalen, klant, etc.)
+    var session=null;
+    if(typeof global.buildSessionObject==="function"){
+      session=global.buildSessionObject();
+    } else {
+      // Fallback: reconstrueer uit globale variabelen
+      session={
+        zalen:       global.zalen||[],
+        clientCo:    (document.getElementById("klt-co")||{}).value||"",
+        clientAddr:  (document.getElementById("klt-addr")||{}).value||"",
+        clientEmail: (document.getElementById("klt-email")||{}).value||"",
+        projectName: (document.getElementById("klt-project")||{}).value||"",
+        contacts:    global.contacts||[],
+        discount:    global.discount||{pct:0}
+      };
+    }
 
-    async function refresh() {
-      try {
-        var existing = opts.sourceId ? await findBySource(opts.sourceId) : null;
-        if (existing) {
-          btn.textContent = "Factuur " + existing.invoice_number;
-          btn.onclick = function () { openHtml(existing.html_content || buildHtml(existing)); };
-        } else {
-          btn.textContent = "Maak factuur";
-          btn.onclick = async function () {
-            if (busy) return;
-            busy = true; btn.disabled = true;
-            var label = btn.textContent; btn.textContent = "Bezig…";
-            try {
-              var quote = typeof opts.getQuote === "function" ? await opts.getQuote() : opts.quote;
-              var invoice = await createAndPreview(quote);
-              if (typeof opts.onDone === "function") opts.onDone(invoice);
-              await refresh();
-            } catch (e) {
-              alert("Factuur mislukt: " + (e && e.message));
-              btn.textContent = label;
-            } finally { btn.disabled = false; busy = false; }
-          };
+    if(!(session.zalen&&session.zalen.length)){
+      _toast("⚠ Geen items om te factureren"); return;
+    }
+
+    // Zoek eventueel bestaande quote-ID
+    var quoteDbId=null;
+    if(typeof global.ensureQuoteId==="function"){
+      // Probeer cloud-ID te vinden
+      try{
+        var cl=global.supaInit();
+        var qid=global.ensureQuoteId();
+        if(qid&&cl){
+          var qr=await cl.from("quotes").select("id").eq("app_quote_id",qid).maybeSingle();
+          if(qr.data) quoteDbId=qr.data.id;
         }
-      } catch (e) { console.warn("[invoice] mountButton:", e && e.message); }
+      }catch(e){}
     }
 
-    refresh();
-    container.appendChild(btn);
-    return btn;
+    try{
+      var inv=await createInvoiceFromQuote(session, quoteDbId);
+      _toast("✓ Factuur "+inv.invoice_number+" aangemaakt");
+      // Open facturatie-dashboard
+      if(typeof global.goPanel==="function") global.goPanel("p-invoices");
+      if(typeof global.loadInvoiceDashboard==="function") setTimeout(global.loadInvoiceDashboard, 100);
+    }catch(e){
+      _toast("⚠ "+e.message);
+    }
   }
 
-  global.Invoice = {
-    createFromQuote: createFromQuote,
-    createAndPreview: createAndPreview,
-    buildHtml: buildHtml,
-    findBySource: findBySource,
-    mountButton: mountButton
+
+  /* ═══════════════════════════════════════════════════════════════
+     Exporteer publiek API
+     ═══════════════════════════════════════════════════════════════ */
+  global.InvoiceModule = {
+    createFromQuote:   createInvoiceFromQuote,
+    get:               getInvoice,
+    list:              listInvoices,
+    updateStatus:      updateInvoiceStatus,
+    delete:            deleteInvoice,
+    downloadPDF:       downloadInvoicePDF,
+    generateHTML:      generateInvoiceHTML,
+    quickFromCurrent:  quickInvoiceFromCurrentQuote
   };
 
-})(typeof window !== "undefined" ? window : this);
+  // Shortcuts voor onclick
+  global.quickInvoiceFromCurrentQuote = quickInvoiceFromCurrentQuote;
+  global.downloadInvoicePDF = downloadInvoicePDF;
+
+})(typeof window!=="undefined"?window:this);
