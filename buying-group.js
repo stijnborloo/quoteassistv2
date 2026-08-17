@@ -136,7 +136,7 @@
   }
   async function getBundleLines(bundleId){
     var cl=global.supaInit(); if(!cl) throw new Error("Supabase niet beschikbaar");
-    var r=await cl.from("buying_bundle_lines").select("*, buying_entities:entity_id(name,code), buying_needs:need_id(product_name,quantity,unit_price_estimate)").eq("bundle_id",bundleId);
+    var r=await cl.from("buying_bundle_lines").select("*, buying_needs:need_id(product_name,quantity,unit_price_estimate)").eq("bundle_id",bundleId);
     if(r.error) throw new Error(r.error.message);
     return r.data||[];
   }
@@ -760,7 +760,7 @@
           +'<th style="padding:8px;text-align:center">Qty</th>'
           +'<th style="padding:8px;text-align:right">Prijs/st</th></tr></thead><tbody>';
         lines.forEach(function(l){
-          var ent=l.buying_entities||{};
+          var ent=_entities.find(function(e){return e.id===l.entity_id;})||{};
           var need=l.buying_needs||{};
           html+='<tr style="border-bottom:1px solid #eee">'
             +'<td style="padding:8px;font-weight:600">'+_esc(ent.name||"—")+' <span style="color:#999;font-size:10px">'+_esc(ent.code||"")+'</span></td>'
