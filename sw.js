@@ -1,6 +1,6 @@
 // QuoteStudio - Service Worker
 // Timestamp: 2026-06-22T00:00:00Z
-var CACHE = "quotestudio-v11";
+var CACHE = "visioffer-v9";
 var INDEX = "index.html";
 
 self.addEventListener("install", function(e) {
