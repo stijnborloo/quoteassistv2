@@ -12565,13 +12565,31 @@ async function applyTenantFromUser(user){
       } else {
         var allowed=(_myTenants||[]).map(function(m){return m.tenant_slug;});
         if(allowed.length===1){
-          TC.lockToTenant(allowed[0]);
-        } else if(allowed.length>1){
-          TC.lockToList(allowed, tid);
-        } else {
-          TC.lockToTenant(tid);
-        }
-      }
+          // Wis gecachete offerte als de tenant wijzigt
+try {
+  var cachedTenant = localStorage.getItem("qs_tenant");
+  if (cachedTenant && cachedTenant !== allowed[0]) {
+    localStorage.removeItem("qs_v3");
+  }
+    } catch(e) {}
+        TC.lockToTenant(allowed[0]);
+    } else if(allowed.length>1){
+        try {
+            var cachedTenant = localStorage.getItem("qs_tenant");
+            if (cachedTenant && cachedTenant !== tid) {
+                localStorage.removeItem("qs_v3");
+            }
+        } catch(e) {}
+        TC.lockToList(allowed, tid);
+    } else {
+        try {
+            var cachedTenant = localStorage.getItem("qs_tenant");
+            if (cachedTenant && cachedTenant !== tid) {
+                localStorage.removeItem("qs_v3");
+            }
+        } catch(e) {}
+        TC.lockToTenant(tid);
+    }
       supaResetClient(); // header moet de nieuwe tenant bevatten
       if(TC.load) TC.load(supaInit());
     }
