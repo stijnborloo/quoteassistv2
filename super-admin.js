@@ -246,10 +246,20 @@
       var c = supa();
       if (!c) throw new Error("Supabase niet beschikbaar.");
 
-      var existing = await c.from("qs_tenants").select("slug").eq("slug", slug).maybeSingle();
-      if (existing && existing.data) throw new Error("Tenant '" + slug + "' bestaat al.");
-
-      var ins = await c.from("qs_tenants").insert({
+    var existing = await c.from("qs_tenants").select("slug").eq("slug", slug).maybeSingle();
+if (existing && existing.data) {
+  steps.push("ℹ Tenant '" + slug + "' bestaat al — user wordt toegevoegd");
+} else {
+  var ins = await c.from("qs_tenants").insert({
+    slug: slug,
+    company_name: name,
+    company_name_short: name,
+    primary_color: color,
+    allow_signup: false
+  });
+  if (ins.error) throw new Error(ins.error.message);
+  steps.push("✓ Tenant '" + slug + "' aangemaakt");
+}
         slug: slug,
         company_name: name,
         company_name_short: name,
