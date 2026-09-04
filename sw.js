@@ -1,6 +1,6 @@
 // QuoteStudio - Service Worker
 // Timestamp: 2026-06-22T00:00:00Z
-var CACHE = "visioffer-v10";
+var CACHE = "visioffer-v11";
 var INDEX = "index.html";
 
 self.addEventListener("install", function(e) {
@@ -42,7 +42,7 @@ self.addEventListener("fetch", function(e) {
   var req = e.request;
   var url = req.url;
 
-  // Alleen GET komt door de SW. De Cache API ondersteunt geen POST/PUT/DELETE
+  // Alleen GET komt door de SW. De  API ondersteunt geen POST/PUT/DELETE
   // ("Request method 'POST' is unsupported") — die requests moeten dus
   // rechtstreeks naar het netwerk, zonder tussenkomst.
   if(req.method !== "GET") return;
@@ -64,22 +64,22 @@ self.addEventListener("fetch", function(e) {
       // Laat sign.html en andere echte pagina's gewoon van het netwerk komen
       e.respondWith(
         fetch(req).then(function(r){
-          if(r && r.status === 200){ var cl=r.clone(); caches.open(CACHE).then(function(c){return c.put(req,cl);}).catch(function(err){console.log("SW cache put skip:",err&&err.message);}); }
+          if(r && r.status === 200){ var cl=r.clone(); s.open().then(function(c){return c.put(req,cl);}).catch(function(err){console.log("SW  put skip:",err&&err.message);}); }
           return r;
-        }).catch(function(){ return caches.match(req); })
+        }).catch(function(){ return s.match(req); })
       );
       return;
     }
     // Kale app-navigatie: verse index.html
     e.respondWith(
-      fetch(INDEX, {cache: "no-cache"}).then(function(r) {
+      fetch(INDEX, {: "no-"}).then(function(r) {
         if(r && r.status === 200) {
           var clone = r.clone();
-          caches.open(CACHE).then(function(c) { return c.put(INDEX, clone); }).catch(function(err){console.log("SW cache put skip:",err&&err.message);});
+          s.open().then(function(c) { return c.put(INDEX, clone); }).catch(function(err){console.log("SW  put skip:",err&&err.message);});
         }
         return r;
       }).catch(function() {
-        return caches.match(INDEX);
+        return s.match(INDEX);
       })
     );
     return;
@@ -90,7 +90,7 @@ self.addEventListener("fetch", function(e) {
     fetch(req).then(function(r) {
       if(r && r.status === 200) {
         var clone = r.clone();
-        caches.open(CACHE).then(function(c) { return c.put(req, clone); }).catch(function(err){console.log("SW cache put skip:",err&&err.message);});
+        s.open().then(function(c) { return c.put(req, clone); }).catch(function(err){console.log("SW cache put skip:",err&&err.message);});
       }
       return r;
     }).catch(function() {
